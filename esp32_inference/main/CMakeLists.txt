@@ -1,0 +1,10 @@
+idf_component_register(SRCS "app_main.c"
+                            "tinyllm_inference.c"
+                            "float32_math.c"
+                            "weight_loader.c"
+                            "attention.c"
+                            "mlp.c"
+                            "lm_head.c"
+                            "tokenizer.c"
+                       INCLUDE_DIRS "."
+                       REQUIRES fatfs driver esp_timer sdmmc)

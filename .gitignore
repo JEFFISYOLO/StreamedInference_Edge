@@ -1,0 +1,36 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+
+# Virtual environments
+venv/
+env/
+ENV/
+
+# VS Code settings
+.vscode/
+
+# Pytest cache
+.pytest_cache/
+
+# macOS
+.DS_Store
+
+# Editor backups
+*~
+
+# ESP32 build artifacts
+esp32_inference/build/
+esp32_inference/sdkconfig
+esp32_inference/sdkconfig.defaults
+
+# Large model/binary files (uncomment if you want to exclude)
+#*.bin
+#*.safetensors
+#model.safetensors

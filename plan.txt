@@ -1,0 +1,131 @@
+### Tiny-LLM Architecture Overview
+
+Based on the model config from arnir0/Tiny-LLM on Hugging Face, this is a single-layer Llama-style decoder-only transformer optimized for tiny inference. Key specs:
+- **Vocab size**: 32,000
+- **Hidden size (d_model)**: 192
+- **Number of layers**: 1
+- **Attention heads**: 2 (query heads)
+- **KV heads**: 1 (using Grouped Query Attention for efficiency)
+- **Head dimension**: 96 (192 / 2)
+- **Intermediate size (FFN expansion)**: 1,024
+- **Max sequence length**: 1,024
+- **Total parameters**: ~12.8 million (dominated by embeddings and LM head at ~6M each; the single layer adds ~700K)
+
+The architecture follows standard Llama structure:
+1. **Input Embeddings** (`embed_tokens`): Lookup table of shape `(32,000, 192)`.
+2. **Layer Norm 1** (`input_layernorm`): RMSNorm with scale `(192,)` and bias `(192,)`.
+3. **Self-Attention**:
+   - `q_proj`: `(192, 192)` (full query projection for 2 heads).
+   - `k_proj`: `(96, 192)` (key projection for 1 KV head).
+   - `v_proj`: `(96, 192)` (value projection for 1 KV head).
+   - `o_proj`: `(192, 192)` (output projection).
+   - No biases in projections (Llama style).
+   - Supports KV caching for autoregressive generation.
+4. **Residual Add & Layer Norm 2** (`post_attention_layernorm`): Another RMSNorm `(192,)` scale + bias.
+5. **Feed-Forward Network (MLP, SwiGLU variant)**:
+   - `gate_proj`: `(1,024, 192)`.
+   - `up_proj`: `(1,024, 192)`.
+   - `down_proj`: `(192, 1,024)`.
+   - No biases.
+6. **Output Layer** (`lm_head`): Linear projection `(32,000, 192)` (untied from input embeddings).
+7. **Final Softmax/Sampling**: Applied to logits.
+
+Your attached PNG diagram aligns well with this—it visualizes the weight tensors in a likely storage/loading order (e.g., embeddings first, then norms/biases as small `(192,)` vectors, attention projections with the split KV shapes `(96 x 192)`, the full `(192 x 192)` for Q/O, MLP projections like `(192 x 1,024)` for down_proj and `(1,024 x 192)` implied for gate/up, and closing with a norm bias). The exact order in the PNG seems to group embeddings + LM head at the top, then layer components. If the diagram uses `(out_features, in_features)` convention (common in PyTorch dumps), it matches perfectly. Total layer weights: ~589K (MLP) + ~110K (attention).
+
+### Feasibility on ESP32-CAM & Streaming Strategy
+
+ESP32-CAM (ESP32-S module) has ~520 KB SRAM + up to 8 MB external SPI RAM (if wired, but CAM variant often uses ~4 MB PSRAM). With SD card access (~10-20 MB/s read), streaming is viable, but you'll hit limits on peak RAM for intermediates (e.g., KV cache at seq=1,024: ~80 KB for int16) and weights. Assume int8 quantization (1 byte/param) for kernels—reduces embed/LM head to ~6 MB each on disk, but streamable in RAM. Use fixed-point (e.g., Q7.1 or int16 accumulators) for math to avoid float overhead.
+
+Your layer-by-layer approach works great here *since there's only 1 layer*, but extend it to *component-by-component* within the layer for tighter RAM control. For autoregressive generation (token-by-token):
+
+#### 1. **Input Embeddings (Per-Token Lookup)**
+   - **Why stream?** Full table is 32K × 192 × 1 byte = ~6 MB—won't fit in RAM.
+   - **How**: Store as row-major on SD (one file per tensor, or concatenated with offsets). For each input token ID `t`, seek to offset `t * 192` bytes, read exactly 192 bytes into a buffer, dequantize to int16/fixed for computation.
+   - **RAM peak**: 192 bytes (raw) + 192 × 2 bytes (working hidden state) = ~0.6 KB.
+   - **For prompt**: Process all prompt tokens sequentially, accumulating hidden states (max seq=1,024 → 1,024 × 192 × 2 = ~400 KB for int16—fits if no PSRAM).
+   - **Tip**: Precompute prompt hidden states if prompt is fixed/short.
+
+#### 2. **Layer Computation (Single Layer: Stream Sub-Components)**
+   - Start with hidden states `h` (1 × 192, int16).
+   - **Layer Norm 1**: Load scale/bias `(192,)` each (~192 bytes). Compute `h = rms_norm(h, scale, bias)`. Discard immediately.
+   - **Self-Attention**:
+     - Load `q_proj` `(192 × 192)` = 36 KB (int8). Compute `q = h @ q_proj` (vector-matrix mul). Discard.
+     - Load `k_proj` `(96 × 192)` = 18 KB. Compute/update KV cache keys. Discard.
+     - Load `v_proj` `(96 × 192)` = 18 KB. Compute/update KV cache values. Discard.
+     - Compute attention scores (q @ k^T / sqrt(96)), softmax, weighted sum with v.
+     - Load `o_proj` `(192 × 192)` = 36 KB. Compute `attn_out = attn @ o_proj`. Discard.
+     - Residual: `h += attn_out`.
+     - **RAM peak**: Largest load (36 KB) + KV cache (~40 KB int8 for full seq) + temps (q/k/v: 192+96+96=384 dims × 2 bytes = ~1.5 KB) + softmax buffer (seq × heads=1,024 × 2 × 2 = 4 KB) ≈ 80 KB total.
+     - **KV Cache**: Append-only on heap (int8 to save space). For generation, grows per token; reset per inference.
+   - **Layer Norm 2**: Load scale/bias, normalize `h`. Discard.
+   - **MLP (SwiGLU)**:
+     - Load `gate_proj` `(1,024 × 192)` = 196 KB. Compute `gate = silu(h @ gate_proj)`. *This is your peak—may exceed 520 KB SRAM; enable PSRAM or chunk it (see below).* Discard.
+     - Load `up_proj` `(1,024 × 192)` = 196 KB. Compute `up = h @ up_proj`. Discard.
+     - Elementwise: `swish = gate * up`.
+     - Load `down_proj` `(192 × 1,024)` = 196 KB. Compute `ffn_out = swish @ down_proj`. Discard.
+     - Residual: `h += ffn_out`.
+     - **RAM peak**: 196 KB (load) + inter temps (1,024 × 2 bytes × 2 = 4 KB) + h (0.4 KB) ≈ 200 KB (per load). Sequential loads keep it under 250 KB.
+     - **Chunking for MLP if RAM tight**: For a proj like gate_proj (out=1,024, in=192), split into chunks of e.g., 128 out-dims. Load chunk `(128 × 192)` = 24 KB, compute partial gate chunk, accumulate in full inter buffer (1,024 × 2 = 2 KB). Repeat 8x. Adds SD seeks but caps load at ~25 KB.
+   - **Full layer RAM**: ~250 KB peak (with chunking), plus KV ~40 KB.
+
+#### 3. **LM Head & Sampling (Per-Token)**
+   - **Why stream?** Full `(32,000 × 192)` = ~6 MB.
+   - **How**: Transpose logically on disk to `(192 × 32,000)` column-major (each column = embedding for one token). To compute `logits = h @ lm_head` (1×192 @ 192×32K):
+     - Initialize `logits` buffer `(32,000,)` as int16 (~64 KB—fits).
+     - Chunk vocab into e.g., 256-token batches. For each: load batch weights `(192 × 256)` = ~48 KB int8, compute partial `logits[batch] += h @ batch_weights`, dequant/scale. Discard batch.
+     - Repeat ~125x (32K / 256). Total seeks: manageable at ~10 ms each.
+   - **RAM peak**: 48 KB (chunk) + full logits (64 KB) + h (0.4 KB) ≈ 115 KB.
+   - **Sampling**: After full logits, apply softmax (or log-softmax in fixed-point), top-k/top-p, nucleus. Use int8 for probs to save space. For speed, precompute log scales if needed.
+   - **Tip**: If vocab sampling is bottleneck, quantize lm_head to int4 (0.5 byte/param, chunks ~24 KB) or use a smaller vocab subset for faster gen.
+
+#### Overall Inference Loop (Pseudocode Sketch)
+```c
+// Assume SD file handles, int8_t buffers, fixed-point matmul kernels (e.g., CMSIS-DSP if ARM, or custom)
+void generate(uint16_t* prompt_tokens, int prompt_len, char* output, int max_new) {
+    float hidden[192];  // int16_t for fixed-point
+    int8_t weight_buf[CHUNK_SIZE];  // e.g., 50 KB max
+    int16_t kv_cache_k[1024][96], kv_cache_v[1024][96];  // Grow as needed
+    int pos = 0;
+
+    // Embed prompt
+    for (int i = 0; i < prompt_len; i++) {
+        load_embed_row(sd_embed_file, prompt_tokens[i], weight_buf, 192);
+        matvec_dequant(hidden, weight_buf, 192);  // h = dequant(row)
+        transformer_layer(hidden, pos++, kv_cache_k, kv_cache_v, sd_layer_files...);
+    }
+
+    // Generate
+    for (int new_t = 0; new_t < max_new; new_t++) {
+        int16_t logits[32000];
+        compute_lm_head(hidden, logits, sd_lm_file, 192, 32000);  // Chunked as above
+        uint16_t next_token = sample(logits, 32000);  // Top-k etc.
+        output[new_t] = token_to_char(next_token);  // Or decode
+
+        load_embed_row(sd_embed_file, next_token, weight_buf, 192);
+        matvec_dequant(hidden, weight_buf, 192);
+        transformer_layer(hidden, pos++, kv_cache_k, kv_cache_v, sd_layer_files...);
+    }
+}
+
+void transformer_layer(float* h, int pos, int16_t* k_cache, int16_t* v_cache, ...) {
+    // Norm1: load_scale_bias(sd_norm1_scale, sd_norm1_bias); rms_norm(h);
+    
+    // Attention: load_proj(sd_q_proj, ...); q = matvec(h, q_w); ... attn_out
+    // h += attn_out;
+    
+    // Norm2: similar
+    
+    // MLP: load_gate_proj_chunked(...); gate = silu(matvec_chunks(h)); similar for up/down
+    // h += ffn_out;
+}
+```
+- **Kernels**: Implement matvec (1×d @ d×m) in assembly/C for speed—ESP32 at 240 MHz can do ~1-2 tokens/sec with int8. Use Q-format (e.g., int16 accum, shift for scale). Test with CMSIS if ported.
+- **File Layout on SD**: One .bin per tensor (e.g., `embed.bin`, `q_proj.bin`), int8 quantized. Use FATFS for seeks. Precompute offsets table in flash.
+- **Optimizations**:
+  - **Quantization**: Post-train int8 (use Hugging Face's `bitsandbytes` to export). Calibrate on tiny dataset.
+  - **PSRAM**: Enable via menuconfig for +4 MB heap.
+  - **Batching**: Single-token only for now; parallelize matvec loops.
+  - **Power/Heat**: CAM's camera off during inference; throttle CPU if needed.
+  - **Test**: Start with dummy matmuls on PC, then ESP-IDF build.
+
+This should run ~0.5-1 token/sec on ESP32-CAM. If you share more (e.g., quantization scheme, specific error, or code snippet), I can refine—e.g., fixed-point RMSNorm math or chunking logic. What's the next blocker for you?

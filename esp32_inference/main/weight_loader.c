@@ -421,14 +421,16 @@ esp_err_t load_lm_head_chunk(float* buffer, int chunk_size, int chunk_index) {
     }
 
     // Not in cache: read from SD using existing projection chunk loader
-    esp_err_t ret = load_projection_chunk(LM_HEAD_FILE, buffer, chunk_size, chunk_index);
+    // For LM head, each token column has HIDDEN_SIZE floats, so request chunk_size * HIDDEN_SIZE floats
+    esp_err_t ret = load_projection_chunk(LM_HEAD_FILE, buffer, chunk_size * HIDDEN_SIZE, chunk_index);
     if (ret != ESP_OK) return ret;
 
     // If cache enabled, allocate PSRAM buffer and copy into cache
     if (lm_cache && lm_cache_capacity > 0) {
-        float* cache_buf = heap_caps_malloc(chunk_size * sizeof(float), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        size_t bytes = (size_t)chunk_size * HIDDEN_SIZE * sizeof(float);
+        float* cache_buf = heap_caps_malloc(bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
         if (cache_buf) {
-            memcpy(cache_buf, buffer, chunk_size * sizeof(float));
+            memcpy(cache_buf, buffer, bytes);
             // Insert into cache (cache will take ownership of cache_buf)
             if (lm_cache_insert_chunk(chunk_index, cache_buf) != ESP_OK) {
                 // insertion failed -> free

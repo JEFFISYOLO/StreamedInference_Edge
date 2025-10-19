@@ -199,11 +199,24 @@ esp_err_t tokenizer_decode(tokenizer_t* tokenizer, const uint16_t* tokens,
         } else if (id == 220) {
             output[out++] = ' ';
         } else if (id < 256) {
-            // Byte-level fallback
-            output[out++] = (char)id;
+            // Byte-level fallback: only print printable ASCII directly.
+            // Non-printable bytes are represented as "\xHH" so the log is readable.
+            if (id >= 32 && id < 127) {
+                output[out++] = (char)id;
+            } else {
+                char hex[8];
+                snprintf(hex, sizeof(hex), "\\x%02X", id);
+                for (int j = 0; hex[j] && out < max_output_len - 1; j++) {
+                    output[out++] = hex[j];
+                }
+            }
         } else {
-            // Unknown token - use placeholder
-            output[out++] = '?';
+            // Unknown token - use placeholder with hex value (use function bound)
+            char hex[12];
+            snprintf(hex, sizeof(hex), "<tok:%04X>", id);
+            for (int j = 0; hex[j] && out < max_output_len - 1; j++) {
+                output[out++] = hex[j];
+            }
         }
     }
     

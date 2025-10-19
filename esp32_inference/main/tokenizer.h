@@ -5,6 +5,8 @@
 #include <stdbool.h>
 #include "esp_err.h"
 
+#define MAX_OUTPUT_LEN 2048  // Maximum length for decoded output string
+
 // Simple tokenizer interface
 typedef struct {
     uint16_t* vocab_tokens;
